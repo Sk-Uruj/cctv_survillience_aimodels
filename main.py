@@ -1,4 +1,3 @@
-# ---- main.py ----
 import cv2
 import threading
 import queue
@@ -7,7 +6,7 @@ import json
 import os
 import numpy as np
 from typing import Optional, Tuple
-
+from notifier import send_intrusion_alert
 from ultralytics import YOLO
 
 SENTINEL = object()
@@ -316,6 +315,9 @@ def main() -> None:
                     try:
                         cv2.imwrite(snapshot_path, latest_frame)
                         print(f"[SYSTEM TRIGGER] Intrusion detected. Snapshot saved to {snapshot_path}")
+
+                        send_intrusion_alert(ts, image_path=snapshot_path)
+
                     except Exception as e:
                         print(f"[SYSTEM TRIGGER] Failed to save snapshot: {e}")
             else:
@@ -345,7 +347,8 @@ def main() -> None:
 
             cv2.imshow("Day7 - GarudAI Intrusion (YOLO11s)", plotted)
 
-            key = cv2.waitKey(30) & 0xFF
+            #30 fps
+            key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 stop_event.set()
                 break
