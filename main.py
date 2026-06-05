@@ -1,15 +1,16 @@
+# ---- main.py ----
 import cv2
 import threading
 import queue
 import time
 import json
+import os
 import numpy as np
 from typing import Optional, Tuple
 
 from ultralytics import YOLO
 
 SENTINEL = object()
-
 
 def load_polygon_from_zone_json(zone_json_path: str) -> np.ndarray:
     """
@@ -23,9 +24,55 @@ def load_polygon_from_zone_json(zone_json_path: str) -> np.ndarray:
     if polygon is None or len(polygon) != 4:
         raise ValueError(f"zone.json must contain polygon with exactly 4 points. Got: {polygon}")
 
-    poly = np.array(polygon, dtype=np.int32)  # (4,2)
-    return poly.reshape((-1, 1, 2)).astype(np.int32)  # (4,1,2)
+    pts = np.array(polygon, dtype=np.int32)  # shape (4, 2)
+    return pts.reshape((-1, 1, 2)).astype(np.int32)  # shape (4, 1, 2)
 
+def scale_polygon_to_fit(pts: np.ndarray, target_w: float, target_h: float) -> np.ndarray:
+    """
+    Scale a 4-point polygon to fit within target width/height.
+    Assumes pts are in the same origin (top-left) coordinate space as the frame.
+    Returns int32 polygon shape (4,1,2).
+    """
+    if pts.size == 0:
+        return pts.astype(np.int32)
+
+    pts_float = pts.astype(np.float32)
+    max_x = float(np.max(pts_float[:, 0]))
+    max_y = float(np.max(pts_float[:, 1]))
+
+    scale = 1.0
+    if max_x > 0 and max_y > 0:
+        scale = min(target_w / max_x, target_h / max_y, 1.0)
+
+    scaled = (pts_float * scale).astype(np.int32)
+    return scaled.reshape((-1, 1, 2))
+
+def get_box_xyxy(box) -> Tuple[int, int, int, int]:
+    """
+    Extract integer (x1, y1, x2, y2) from an Ultralytics box element.
+    """
+    xyxy = box.xyxy[0].tolist()  # [x1,y1,x2,y2]
+    x1, y1, x2, y2 = xyxy
+    return int(x1), int(y1), int(x2), int(y2)
+
+def filter_results_to_person(results, person_class_id: int = 0):
+    """
+    Filter Ultralytics tracking results to ONLY keep COCO class 0 ("person").
+    Modifies results[0].boxes in-place.
+    """
+    r0 = results[0]
+    if getattr(r0, "boxes", None) is None or len(r0.boxes) == 0:
+        return results
+
+    cls = r0.boxes.cls  # tensor-like
+    keep_mask = (cls == person_class_id)
+
+    if keep_mask.sum().item() == 0:
+        r0.boxes = r0.boxes[:0]
+        return results
+
+    r0.boxes = r0.boxes[keep_mask]
+    return results
 
 def reader_thread(
     cap: cv2.VideoCapture,
@@ -39,6 +86,7 @@ def reader_thread(
     - Pushes frames into a bounded queue to avoid lag buildup.
     - Drops older frames if the queue is full (latest-frame preference).
     - Signals shutdown via stop_event + SENTINEL.
+    - Includes a fixed 0.033s sleep to enforce 30 FPS pacing.
     """
     frame_count = 0
     try:
@@ -46,6 +94,7 @@ def reader_thread(
             print("[Reader] thread started")
 
         while not stop_event.is_set():
+            t_start = time.time()
             ret, frame = cap.read()
             if not ret:
                 if debug:
@@ -57,14 +106,24 @@ def reader_thread(
             try:
                 q.put_nowait(frame)
             except queue.Full:
+                # Drop oldest to keep latest frame
                 try:
-                    _ = q.get_nowait()  # drop oldest
+                    _ = q.get_nowait()
                 except queue.Empty:
                     pass
                 try:
                     q.put_nowait(frame)
                 except queue.Full:
                     pass
+
+            # Enforce a 30 FPS ingestion pace
+            elapsed = time.time() - t_start
+            sleep_needed = max(0.0, 0.033 - elapsed)
+            if sleep_needed > 0:
+                time.sleep(sleep_needed)
+            else:
+                # If decoding took longer than 33ms, yield briefly
+                time.sleep(0.001)
     except Exception as e:
         print("[Reader] Exception:", repr(e))
         stop_event.set()
@@ -78,117 +137,74 @@ def reader_thread(
         if debug:
             print(f"[Reader] exiting. total frames read: {frame_count}")
 
-
-def filter_results_to_person(results, person_class_id: int = 0):
-    """
-    Filter Ultralytics tracking results to ONLY keep COCO class 0 ("person").
-    Modifies results[0].boxes in-place.
-    """
-    r0 = results[0]
-    if r0.boxes is None or len(r0.boxes) == 0:
-        return results
-
-    cls = r0.boxes.cls  # tensor-like
-    keep_mask = (cls == person_class_id)
-
-    if keep_mask.sum().item() == 0:
-        r0.boxes = r0.boxes[:0]
-        return results
-
-    r0.boxes = r0.boxes[keep_mask]
-    return results
-
-
-def get_box_xyxy(box) -> Tuple[int, int, int, int]:
-    """
-    Extract integer (x1, y1, x2, y2) from an Ultralytics box element.
-    """
-    xyxy = box.xyxy[0].tolist()  # [x1,y1,x2,y2]
-    x1, y1, x2, y2 = xyxy
-    return int(x1), int(y1), int(x2), int(y2)
-
-
-def draw_fence(plotted, polygon_array_4x1x2: np.ndarray, color, thickness: int = 3):
-    """
-    Draws fence polygon lines + translucent fill.
-    polygon_array_4x1x2: shape (4,1,2)
-    """
-    pts = polygon_array_4x1x2.reshape((-1, 2))
-
-    cv2.polylines(
-        plotted,
-        [pts],
-        isClosed=True,
-        color=color,
-        thickness=thickness,
-        lineType=cv2.LINE_AA,
-    )
-
-    overlay = plotted.copy()
-    cv2.fillPoly(overlay, [pts], color=color)
-    alpha = 0.10  # translucency
-    cv2.addWeighted(overlay, alpha, plotted, 1 - alpha, 0, plotted)
-
-
 def main() -> None:
+    # Configuration
     video_path = "sample.mp4"
     zone_json_path = "zone.json"
+    MODEL_WEIGHTS = "yolo11s.pt"  # Day 5: medium variant
+    ALERTS_DIR = "alerts"
 
-    # Day 4 -> Day 5: parameters
     QUEUE_MAXSIZE = 2
     FIRST_FRAME_TIMEOUT_S = 5.0
     LOOP_GET_TIMEOUT_S = 0.5
-
-    # Speed/accuracy tuning from requirements
-    MODEL_WEIGHTS = "yolo11s.pt"  # Day 5: medium variant
-    PERSON_CLASS_ID = 0  # COCO: person
     TRACK_CONF = 0.25
     TRACK_IOU = 0.45
+    PERSON_CLASS_ID = 0  # COCO: person
 
-    # Load polygon fence
-    polygon_array = load_polygon_from_zone_json(zone_json_path)
-    polygon_array = np.ascontiguousarray(polygon_array, dtype=np.int32)
+    # Prepare alerts directory
+    if not os.path.exists(ALERTS_DIR):
+        os.makedirs(ALERTS_DIR, exist_ok=True)
 
-    # Load model once
-    model = YOLO(MODEL_WEIGHTS)
-
-    # Video capture (reader thread owns reads)
+    # Load video and verify
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
 
+    # Read current frame resolution
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Load and scale zone polygon to current frame resolution
+    try:
+        base_poly = load_polygon_from_zone_json(zone_json_path)  # (4,1,2)
+        # Scale polygon to fit current video frame resolution
+        scaled_pts = scale_polygon_to_fit(base_poly.reshape(-1, 2).astype(np.int32), frame_width, frame_height)
+        polygon_array = scaled_pts.reshape((4, 1, 2)).astype(np.int32)  # (4,1,2)
+    except Exception as e:
+        print(f"[Init] Warning: zone polygon load/scale failed: {e}")
+        # Fallback: empty polygon (no intrusion checks)
+        polygon_array = np.zeros((4, 1, 2), dtype=np.int32)
+
+    # Load model
+    model = YOLO(MODEL_WEIGHTS)
+
+    # Prepare reader thread
     q: "queue.Queue[object]" = queue.Queue(maxsize=QUEUE_MAXSIZE)
     stop_event = threading.Event()
 
-    t = threading.Thread(
-        target=reader_thread,
-        args=(cap, q, stop_event, False),
-        daemon=True,
-    )
+    t = threading.Thread(target=reader_thread, args=(cap, q, stop_event, False), daemon=True)
     t.start()
 
-    print("[Main] Day5 running: Virtual Fence Intrusion + Tuned Tracking. Press 'q' to quit.")
+    print("[Main] GarudAI Day7: Robust Intrusion Loop (30 FPS). Press 'q' to quit.")
 
     latest_frame: Optional[any] = None
     first_frame_received = False
     first_deadline = time.time() + FIRST_FRAME_TIMEOUT_S
 
-    # FPS overlay
+    # Overlay / visualization
     fps_smooth = None
     fps_alpha = 0.2
     prev_t = time.time()
 
-    # Visual colors (BGR)
-    BLUE = (255, 0, 0)   # bright blue
-    RED = (0, 0, 255)    # bright red
+    BLUE = (255, 0, 0)   # BGR
+    RED = (0, 0, 255)
+    GREEN = (0, 255, 0)
 
     FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-    # Alert logging throttling (2 seconds)
-    last_alert_log_t = 0.0
-    ALERT_LOG_EVERY_S = 2.0
+    # Edge-state for intrusion
+    zone_was_violated = False
 
-    # Main loop
     try:
         while not stop_event.is_set():
             try:
@@ -221,7 +237,7 @@ def main() -> None:
             if latest_frame is None:
                 continue
 
-            # Tracking inference (tuned sensitivity)
+            # Inference: track humans
             results = model.track(
                 source=latest_frame,
                 persist=True,
@@ -230,10 +246,10 @@ def main() -> None:
                 iou=TRACK_IOU,
             )
 
-            # Person-only filtering
+            # Keep only COCO 'person' class
             results = filter_results_to_person(results, person_class_id=PERSON_CLASS_ID)
 
-            # Base visualization (includes boxes/IDs if available)
+            # Base visualization (boxes/IDs)
             plotted = results[0].plot()
 
             intruding_any = False
@@ -242,81 +258,75 @@ def main() -> None:
             if getattr(r0.boxes, "id", None) is not None:
                 ids = r0.boxes.id
 
-            # Check each detected person using bottom-center point
+            # If there are detections, test each bounding box against the polygon
             if r0.boxes is not None and len(r0.boxes) > 0:
                 for idx in range(len(r0.boxes)):
                     box = r0.boxes[idx]
                     x1, y1, x2, y2 = get_box_xyxy(box)
 
-                    x_center = (x1 + x2) / 2.0
-                    y_bottom = (y1 + y2) / 2.0
+                    # Anchor points: head (top-center), center (dead-center), feet (bottom-center)
+                    head = (int((x1 + x2) / 2.0), int(y1))
+                    center_pt = (int((x1 + x2) / 2.0), int((y1 + y2) / 2.0))
+                    feet = (int((x1 + x2) / 2.0), int(y2))
 
-                    inside = cv2.pointPolygonTest(polygon_array, (x_center, y_bottom), False)
-                    if inside >= 0:
-                        intruding_any = True
+                    anchor_points = [head, center_pt, feet]
 
-                        # Emphasize this person's box + optional asterisk
-                        cv2.rectangle(plotted, (x1, y1), (x2, y2), RED, 2)
-                        cv2.putText(
-                            plotted,
-                            "*",
-                            (x1, max(0, y1 - 8)),
-                            FONT,
-                            1.0,
-                            RED,
-                            3,
-                            cv2.LINE_AA,
-                        )
+                    inside_any = False
+                    for pt in anchor_points:
+                        if cv2.pointPolygonTest(polygon_array, pt, False) >= 0:
+                            inside_any = True
+                            intruding_any = True
+                            # Emphasize this person on intrusion
+                            cv2.rectangle(plotted, (x1, y1), (x2, y2), RED, 2)
+                            # Mark the triggering anchor
+                            cv2.circle(plotted, (pt[0], pt[1]), 4, GREEN, -1)
 
-                        # If IDs exist, label them
-                        if ids is not None:
-                            try:
-                                pid_val = ids[idx]
-                                pid = int(pid_val.item()) if hasattr(pid_val, "item") else int(pid_val)
-                                cv2.putText(
-                                    plotted,
-                                    f"person {pid}",
-                                    (x1, max(0, y1 - 12)),
-                                    FONT,
-                                    0.7,
-                                    RED,
-                                    2,
-                                    cv2.LINE_AA,
-                                )
-                            except Exception:
-                                # Don't crash if ID formatting fails
-                                pass
+                            if ids is not None:
+                                try:
+                                    pid_val = ids[idx]
+                                    pid = int(pid_val.item()) if hasattr(pid_val, "item") else int(pid_val)
+                                    cv2.putText(
+                                        plotted,
+                                        f"person {pid}",
+                                        (x1, max(0, y1 - 12)),
+                                        FONT,
+                                        0.7,
+                                        RED,
+                                        2,
+                                        cv2.LINE_AA,
+                                    )
+                                except Exception:
+                                    pass
+                            break  # one intrusion per bbox is enough
+                    # end for anchor_points
+            # end if detections present
 
-            # Draw fence overlay (blue safe, red intrusion)
+            # Draw the fence polygon (blue when safe, red when intruding)
             fence_color = RED if intruding_any else BLUE
-            draw_fence(plotted, polygon_array, fence_color, thickness=3)
+            cv2.polylines(plotted, [polygon_array.reshape(-1, 2)], isClosed=True, color=fence_color, thickness=3)
 
-            # Warning banner + throttled alert logger
+            # Edge-triggered alert: save snapshot on first breach frame
             if intruding_any:
-                cv2.putText(
-                    plotted,
-                    "WARNING: INTRUSION DETECTED",
-                    (10, 80),
-                    FONT,
-                    1.2,
-                    RED,
-                    4,
-                    cv2.LINE_AA,
-                )
-
-                now_t = time.time()
-                if (now_t - last_alert_log_t) >= ALERT_LOG_EVERY_S:
-                    last_alert_log_t = now_t
-                    # Timestamp format: 2026-06-03 20:15:00
-                    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_t))
-                    print(f"[ALERT] {ts} - Intrusion Detected in Restricted Zone!")
+                if not zone_was_violated:
+                    zone_was_violated = True
+                    now_t = time.time()
+                    ts = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(now_t))
+                    snapshot_path = os.path.join(ALERTS_DIR, f"breach-{ts}.jpg")
+                    # Save the exact frame where breach was detected
+                    try:
+                        cv2.imwrite(snapshot_path, latest_frame)
+                        print(f"[SYSTEM TRIGGER] Intrusion detected. Snapshot saved to {snapshot_path}")
+                    except Exception as e:
+                        print(f"[SYSTEM TRIGGER] Failed to save snapshot: {e}")
+            else:
+                # Reset for the next breach
+                zone_was_violated = False
 
             # FPS overlay
             now_t = time.time()
             dt = now_t - prev_t
             prev_t = now_t
             inst_fps = (1.0 / dt) if dt > 0 else 0.0
-
             if fps_smooth is None:
                 fps_smooth = inst_fps
             else:
@@ -328,12 +338,12 @@ def main() -> None:
                 (10, 30),
                 FONT,
                 0.9,
-                (0, 255, 0),
+                GREEN,
                 2,
                 cv2.LINE_AA,
             )
 
-            cv2.imshow("Day5 - Virtual Fence Intrusion (YOLO11m tuned)", plotted)
+            cv2.imshow("Day7 - GarudAI Intrusion (YOLO11s)", plotted)
 
             key = cv2.waitKey(30) & 0xFF
             if key == ord("q"):
@@ -348,7 +358,6 @@ def main() -> None:
             pass
         cv2.destroyAllWindows()
         print("[Main] shutdown complete.")
-
 
 if __name__ == "__main__":
     main()
